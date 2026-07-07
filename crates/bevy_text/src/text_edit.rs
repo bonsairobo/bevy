@@ -1,9 +1,11 @@
 use bevy_clipboard::ClipboardRead;
 use bevy_math::Vec2;
 use bevy_reflect::Reflect;
+use core::ops::Range;
 use parley::PlainEditorDriver;
 use smol_str::SmolStr;
 
+use crate::editing::ObscuredText;
 use crate::TextBrush;
 
 /// A selection within IME preedit text, expressed as byte offsets from the start of the preedit.
@@ -245,7 +247,7 @@ impl TextEdit {
                     For proper handling of async clipboard operations, use `EditableText::apply_pending_edits` instead.");
 
                 let mut read = clipboard.fetch_text();
-                poll_and_apply_paste(&mut read, driver, max_characters, char_filter);
+                poll_and_apply_paste(&mut read, driver, None, max_characters, char_filter);
             }
             TextEdit::Insert(text) => {
                 let _ = insert_filtered(driver, text.as_str(), max_characters, char_filter);
@@ -365,15 +367,19 @@ fn insert_filtered(
 pub(crate) fn poll_and_apply_paste(
     read: &mut ClipboardRead,
     driver: &mut PlainEditorDriver<TextBrush>,
+    mut obscured: Option<&mut ObscuredText>,
     max_characters: Option<usize>,
     char_filter: impl Fn(char) -> bool,
 ) -> bool {
     match read.poll_result() {
         Some(Ok(text)) => {
-            if matches!(
-                insert_filtered(driver, &text, max_characters, char_filter),
-                Err(InsertRejection::CharFilter)
-            ) {
+            let rejection = match &mut obscured {
+                Some(obscured) => {
+                    insert_filtered_obscured(driver, obscured, &text, max_characters, char_filter)
+                }
+                None => insert_filtered(driver, &text, max_characters, char_filter),
+            };
+            if matches!(rejection, Err(InsertRejection::CharFilter)) {
                 bevy_log::debug!(
                     "Paste rejected: clipboard contents contained characters not allowed by the char filter."
                 );
@@ -385,5 +391,408 @@ pub(crate) fn poll_and_apply_paste(
             true
         }
         None => false,
+    }
+}
+
+/// Apply a [`TextEdit`] to an obscured (password-style) input.
+///
+/// The editor buffer holds one mask character per real character, so cursor
+/// movement, selection, and hit-testing all work on the masked text
+/// unchanged. Content edits are applied to the masked buffer via the driver
+/// and mirrored onto the real text by character position — the two stay in
+/// a strict one-`char`-to-one-`char` correspondence.
+///
+/// Deviations from plain behavior, all deliberate:
+/// - [`TextEdit::Copy`] is a no-op and [`TextEdit::Cut`] only deletes: the
+///   hidden text is never placed on the clipboard.
+/// - [`TextEdit::ImeSetCompose`] is ignored (preedit would reveal real text
+///   inside the masked buffer and break the char correspondence);
+///   [`TextEdit::ImeCommit`] still inserts.
+/// - Word-wise movement and deletion segment the *mask characters*, not the
+///   hidden text — segmenting the real text would leak its word structure.
+pub(crate) fn apply_obscured(
+    edit: TextEdit,
+    driver: &mut PlainEditorDriver<TextBrush>,
+    obscured: &mut ObscuredText,
+    clipboard: &mut bevy_clipboard::Clipboard,
+    max_characters: Option<usize>,
+    char_filter: impl Fn(char) -> bool,
+) {
+    match edit {
+        TextEdit::Copy => {}
+        TextEdit::Cut => {
+            if !driver.editor.raw_selection().is_collapsed() {
+                delete_obscured(driver, obscured, TextEdit::Delete);
+            }
+        }
+        TextEdit::Paste => {
+            bevy_log::warn_once!("Directly applying a Paste edit is not recommended, as it cannot defer asynchronous clipboard reads.
+                For proper handling of async clipboard operations, use `EditableText::apply_pending_edits` instead.");
+            let mut read = clipboard.fetch_text();
+            poll_and_apply_paste(
+                &mut read,
+                driver,
+                Some(obscured),
+                max_characters,
+                char_filter,
+            );
+        }
+        TextEdit::Insert(text) => {
+            let _ = insert_filtered_obscured(
+                driver,
+                obscured,
+                text.as_str(),
+                max_characters,
+                char_filter,
+            );
+        }
+        TextEdit::ImeCommit { value } => {
+            let _ = insert_filtered_obscured(
+                driver,
+                obscured,
+                value.as_str(),
+                max_characters,
+                char_filter,
+            );
+        }
+        TextEdit::ImeSetCompose { .. } => {
+            bevy_log::debug_once!(
+                "IME preedit is not supported on obscured text inputs; composition ignored."
+            );
+        }
+        edit @ (TextEdit::Backspace
+        | TextEdit::BackspaceWord
+        | TextEdit::Delete
+        | TextEdit::DeleteWord) => delete_obscured(driver, obscured, edit),
+        // Everything else moves the cursor or selection over the masked
+        // buffer; no mirroring required. (The clipboard is unused by these.)
+        other => other.apply(driver, clipboard, max_characters, char_filter),
+    }
+}
+
+/// The current selection of the masked buffer, as a `char` range.
+///
+/// Exact because the masked buffer consists solely of copies of the mask
+/// character: byte offsets are always a multiple of its UTF-8 length.
+fn selected_chars(driver: &PlainEditorDriver<TextBrush>, obscured: &ObscuredText) -> Range<usize> {
+    let mask_len = obscured.mask_char().len_utf8();
+    let bytes = driver.editor.raw_selection().text_range();
+    debug_assert!(bytes.start.is_multiple_of(mask_len) && bytes.end.is_multiple_of(mask_len));
+    (bytes.start / mask_len)..(bytes.end / mask_len)
+}
+
+/// Convert a `char` range into a byte range of `real`.
+fn real_byte_range(real: &str, chars: Range<usize>) -> Range<usize> {
+    let byte_of = |char_index| {
+        real.char_indices()
+            .nth(char_index)
+            .map(|(byte, _)| byte)
+            .unwrap_or(real.len())
+    };
+    byte_of(chars.start)..byte_of(chars.end)
+}
+
+/// Obscured counterpart of [`insert_filtered`]: filter and length-check the
+/// *real* text, splice it into the hidden buffer at the selection, and insert
+/// mask characters into the editor.
+fn insert_filtered_obscured(
+    driver: &mut PlainEditorDriver<TextBrush>,
+    obscured: &mut ObscuredText,
+    text: &str,
+    max_characters: Option<usize>,
+    char_filter: impl Fn(char) -> bool,
+) -> Result<(), InsertRejection> {
+    if !text.chars().all(char_filter) {
+        return Err(InsertRejection::CharFilter);
+    }
+    let selection = selected_chars(driver, obscured);
+    if let Some(max) = max_characters {
+        let current = obscured.text().chars().count();
+        if max < current - selection.len() + text.chars().count() {
+            return Err(InsertRejection::MaxLength);
+        }
+    }
+    let masked = obscured.mask_of(text);
+    let byte_range = real_byte_range(obscured.text(), selection);
+    obscured.text_mut().replace_range(byte_range, text);
+    driver.insert_or_replace_selection(&masked);
+    Ok(())
+}
+
+/// Apply a deletion edit to the masked buffer and mirror the removed `char`
+/// range onto the real text.
+///
+/// The removed range is derived from the pre-edit selection plus the change
+/// in character count — never by diffing the (uniform) masked text:
+/// - a non-collapsed selection is what all four deletions remove;
+/// - otherwise backward deletions end at the caret, forward ones start there.
+fn delete_obscured(
+    driver: &mut PlainEditorDriver<TextBrush>,
+    obscured: &mut ObscuredText,
+    edit: TextEdit,
+) {
+    let selection = selected_chars(driver, obscured);
+    let before = obscured.text().chars().count();
+    let backward = matches!(edit, TextEdit::Backspace | TextEdit::BackspaceWord);
+    match edit {
+        TextEdit::Backspace => driver.backdelete(),
+        TextEdit::BackspaceWord => driver.backdelete_word(),
+        TextEdit::Delete => driver.delete(),
+        TextEdit::DeleteWord => driver.delete_word(),
+        _ => unreachable!("delete_obscured only receives deletion edits"),
+    }
+    let after = driver.editor.text().chars().count();
+    let removed = before - after;
+    if removed == 0 {
+        return;
+    }
+    let removed_chars = if !selection.is_empty() {
+        debug_assert_eq!(removed, selection.len());
+        selection
+    } else if backward {
+        (selection.start - removed)..selection.start
+    } else {
+        selection.start..(selection.start + removed)
+    };
+    let byte_range = real_byte_range(obscured.text(), removed_chars);
+    obscured.text_mut().replace_range(byte_range, "");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EditableText;
+    use alloc::string::ToString;
+    use alloc::sync::Arc;
+    use alloc::vec::Vec;
+    use parley::{fontique::Blob, FontContext, LayoutContext};
+
+    fn contexts() -> (FontContext, LayoutContext<TextBrush>) {
+        let mut font_context = FontContext::new();
+        font_context.collection.register_fonts(
+            Blob::new(Arc::new(include_bytes!("FiraMono-subset.ttf").to_vec())),
+            None,
+        );
+        (font_context, LayoutContext::new())
+    }
+
+    /// Point the editor's default style at the registered test font; without
+    /// a resolvable family nothing shapes, and cluster-based operations
+    /// (movement, selection) silently no-op.
+    fn use_test_font(input: &mut EditableText) {
+        input
+            .editor
+            .edit_styles()
+            .insert(parley::StyleProperty::FontFamily(
+                parley::FontFamily::named("Fira Mono"),
+            ));
+    }
+
+    fn obscured_input(mask_char: char) -> EditableText {
+        let mut input = EditableText::new_obscured(mask_char);
+        use_test_font(&mut input);
+        input
+    }
+
+    fn apply(input: &mut EditableText, edits: impl IntoIterator<Item = TextEdit>) {
+        let (mut font_context, mut layout_context) = contexts();
+        let mut clipboard = bevy_clipboard::Clipboard::default();
+        input.pending_edits.extend(edits);
+        input.apply_pending_edits(
+            &mut font_context,
+            &mut layout_context,
+            &mut clipboard,
+            |_| true,
+        );
+    }
+
+    fn apply_filtered(
+        input: &mut EditableText,
+        edits: impl IntoIterator<Item = TextEdit>,
+        filter: impl Fn(char) -> bool,
+    ) {
+        let (mut font_context, mut layout_context) = contexts();
+        let mut clipboard = bevy_clipboard::Clipboard::default();
+        input.pending_edits.extend(edits);
+        input.apply_pending_edits(
+            &mut font_context,
+            &mut layout_context,
+            &mut clipboard,
+            filter,
+        );
+    }
+
+    fn insert(text: &str) -> TextEdit {
+        TextEdit::Insert(SmolStr::new(text))
+    }
+
+    /// The masked buffer must contain exactly one mask char per real char.
+    fn assert_masked(input: &EditableText) {
+        let obscured = input.obscured.as_ref().expect("obscured input");
+        let buffer = input.editor().text().to_string();
+        assert!(
+            buffer.chars().all(|c| c == obscured.mask_char()),
+            "{buffer:?}"
+        );
+        assert_eq!(buffer.chars().count(), input.value().chars().count());
+    }
+
+    #[test]
+    fn typing_is_masked_and_value_is_real() {
+        let mut input = obscured_input('*');
+        apply(&mut input, [insert("hunter2")]);
+        assert_eq!(input.value(), "hunter2");
+        assert_eq!(input.editor().text().to_string(), "*******");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn masking_is_per_char_for_multibyte_text() {
+        let mut input = EditableText::new_obscured('\u{2022}');
+        apply(&mut input, [insert("p\u{e9}\u{1f600}z")]);
+        assert_eq!(input.value(), "p\u{e9}\u{1f600}z");
+        assert_eq!(input.editor().text().chars().count(), 4);
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn deletions_mirror_by_position() {
+        let mut input = obscured_input('*');
+        apply(&mut input, [insert("abcd")]);
+        // Caret between b and c: ab|cd
+        apply(&mut input, [TextEdit::Left(false), TextEdit::Left(false)]);
+        apply(&mut input, [TextEdit::Backspace]);
+        assert_eq!(input.value(), "acd");
+        apply(&mut input, [TextEdit::Delete]);
+        assert_eq!(input.value(), "ad");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn word_deletions_mirror_whatever_the_mask_segments_to() {
+        // Word boundaries are computed over the *mask characters* (deliberate:
+        // segmenting the real text would leak word structure through word-wise
+        // ops). Whatever count a word deletion removes from the mask must come
+        // off the same position of the real text.
+        let mut input = obscured_input('*');
+        apply(&mut input, [insert("correcthorse")]);
+        apply(&mut input, [TextEdit::BackspaceWord]);
+        let remaining = input.editor().text().chars().count();
+        assert!(remaining < 12, "a word deletion must remove something");
+        assert_eq!(input.value(), "correcthorse"[..remaining].to_string());
+        assert_masked(&input);
+        // Repeated word deletions still empty the field.
+        for _ in 0..12 {
+            apply(&mut input, [TextEdit::BackspaceWord]);
+        }
+        assert_eq!(input.value(), "");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn selection_replacement() {
+        let mut input = obscured_input('*');
+        apply(
+            &mut input,
+            [insert("old"), TextEdit::SelectAll, insert("new!")],
+        );
+        assert_eq!(input.value(), "new!");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn cut_deletes_without_copy_and_copy_is_inert() {
+        let mut input = obscured_input('*');
+        apply(
+            &mut input,
+            [insert("secret"), TextEdit::SelectAll, TextEdit::Copy],
+        );
+        assert_eq!(input.value(), "secret", "copy must not modify");
+        // Cut removes the selection; that the clipboard is untouched is
+        // enforced by construction (the obscured path never calls set_text
+        // on the clipboard) rather than asserted, since headless clipboard
+        // state is not reliably observable.
+        apply(&mut input, [TextEdit::Cut]);
+        assert_eq!(input.value(), "");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn filter_and_max_characters_apply_to_real_text() {
+        let mut input = obscured_input('*');
+        input.max_characters = Some(4);
+        apply_filtered(&mut input, [insert("abc1")], |c| c.is_ascii_alphabetic());
+        assert_eq!(input.value(), "", "rejected inserts leave no residue");
+        apply_filtered(&mut input, [insert("abcd"), insert("e")], |c| {
+            c.is_ascii_alphabetic()
+        });
+        assert_eq!(input.value(), "abcd", "max_characters counts real chars");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn ime_commit_inserts_and_preedit_is_ignored() {
+        let mut input = obscured_input('*');
+        apply(
+            &mut input,
+            [
+                TextEdit::ImeSetCompose {
+                    value: SmolStr::new("\u{306b}"),
+                    cursor: None,
+                },
+                TextEdit::ImeCommit {
+                    value: SmolStr::new("\u{65e5}\u{672c}"),
+                },
+            ],
+        );
+        assert_eq!(input.value(), "\u{65e5}\u{672c}");
+        assert_masked(&input);
+    }
+
+    #[test]
+    fn toggling_obscured_converts_content() {
+        let mut input = EditableText::new("hunter2");
+        use_test_font(&mut input);
+        input.set_obscured(Some('*'));
+        assert_eq!(input.editor().text().to_string(), "*******");
+        assert_eq!(input.value(), "hunter2");
+        input.set_obscured(None);
+        assert_eq!(input.editor().text().to_string(), "hunter2");
+        assert_eq!(input.value(), "hunter2");
+    }
+
+    #[test]
+    fn clear_clears_the_real_text_too() {
+        let mut input = obscured_input('*');
+        apply(&mut input, [insert("secret")]);
+        input.clear();
+        assert_eq!(input.value(), "");
+        assert_eq!(input.editor().text().to_string(), "");
+    }
+
+    #[test]
+    fn plain_value_borrows_and_matches() {
+        let mut input = EditableText::default();
+        use_test_font(&mut input);
+        apply(&mut input, [insert("plain")]);
+        let value = input.value();
+        assert_eq!(value, "plain");
+        assert!(matches!(value, alloc::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn movement_edits_stay_in_bounds() {
+        let mut input = obscured_input('*');
+        let motions: Vec<TextEdit> = alloc::vec![
+            TextEdit::TextStart(false),
+            TextEdit::Right(true),
+            TextEdit::WordRight(true),
+            TextEdit::LineEnd(false),
+            TextEdit::Backspace,
+        ];
+        apply(&mut input, [insert("abcdef")]);
+        apply(&mut input, motions);
+        assert_eq!(input.value(), "abcde");
+        assert_masked(&input);
     }
 }

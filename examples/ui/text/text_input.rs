@@ -60,7 +60,7 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 
     let text_instructions = commands
         .spawn((
-            Text::new("Enter to submit text\nTab to switch inputs"),
+            Text::new("Enter to submit text\nTab to switch inputs\nThe third input is obscured (password-style)"),
             TextFont {
                 font: asset_server.load("fonts/FiraSans-Bold.ttf").into(),
                 font_size: FontSize::Px(25.0),
@@ -69,8 +69,9 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
         ))
         .id();
 
-    let text_input_left = build_input_text(&mut commands, true, 24.0);
-    let text_input_right = build_input_text(&mut commands, false, 24.0);
+    let text_input_left = build_input_text(&mut commands, "Left", 0, 24.0, false);
+    let text_input_right = build_input_text(&mut commands, "Right", 1, 24.0, false);
+    let text_input_password = build_input_text(&mut commands, "Password", 2, 24.0, true);
 
     let input_container = commands
         .spawn((
@@ -108,14 +109,31 @@ fn setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 
     commands
         .entity(input_container)
-        .add_children(&[text_input_left, text_input_right]);
+        .add_children(&[text_input_left, text_input_right, text_input_password]);
 
     commands
         .entity(root)
         .add_children(&[text_instructions, input_container, text_output]);
 }
 
-fn build_input_text(commands: &mut Commands, is_left: bool, font_size: f32) -> Entity {
+fn build_input_text(
+    commands: &mut Commands,
+    name: &'static str,
+    tab_index: i32,
+    font_size: f32,
+    obscured: bool,
+) -> Entity {
+    let editable_text = EditableText {
+        visible_width: Some(10.),
+        allow_newlines: false,
+        // The layout only ever sees the mask character, and `value()`
+        // returns the real (hidden) text.
+        ..if obscured {
+            EditableText::new_obscured('*')
+        } else {
+            EditableText::default()
+        }
+    };
     commands
         .spawn((
             Node {
@@ -123,19 +141,15 @@ fn build_input_text(commands: &mut Commands, is_left: bool, font_size: f32) -> E
                 ..Default::default()
             },
             BorderColor::from(Color::from(SLATE_300)),
-            Name::new(if is_left { "Left" } else { "Right" }),
-            EditableText {
-                visible_width: Some(10.),
-                allow_newlines: false,
-                ..Default::default()
-            },
+            Name::new(name),
+            editable_text,
             TextLayout::no_wrap(),
             TextFont {
                 font_size: FontSize::Px(font_size),
                 ..default()
             },
             TextCursorStyle::default(),
-            TabIndex(if is_left { 0 } else { 1 }),
+            TabIndex(tab_index),
             BackgroundColor(DARK_GREY.into()),
         ))
         .id()

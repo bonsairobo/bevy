@@ -27,6 +27,9 @@
 //! - Input Method Editor (IME) support for complex scripts (Japanese, Chinese, Korean, etc.)
 //! - Bidirectional text support (e.g., mixing left-to-right and right-to-left scripts)
 //! - Input consumption (preventing other systems from receiving keyboard input events when the text input is focused)
+//! - Password-style character masking via [`EditableText::new_obscured`] / [`EditableText::set_obscured`].
+//!   While obscured: clipboard copy/cut never receive the hidden text, and IME preedit is disabled
+//!   (committed IME text is still inserted).
 //!
 //! You might use this widget as the basis for text input fields in forms, chat boxes, for naming characters,
 //! or any other scenario where you want to extract an unformatted text string from the user.
@@ -59,7 +62,6 @@
 //! - Placeholder text (displayed when the input is empty)
 //! - Undo/redo functionality
 //! - Text validation (e.g., email format, numeric input)
-//! - Password-style character masking
 //! - Mobile pop-up keyboard support
 //! - Overwrite mode (typically toggled by the `Insert` key)
 //! - AccessKit integration for screen readers and other assistive technologies
@@ -76,6 +78,8 @@ use crate::{
     text_edit::{poll_and_apply_paste, TextEdit},
     FontCx, FontHinting, LayoutCx, LineHeight, TextBrush, TextColor, TextFont, TextLayout,
 };
+use alloc::borrow::Cow;
+use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use bevy_clipboard::ClipboardRead;
 use bevy_derive::{Deref, DerefMut};
@@ -144,6 +148,14 @@ pub struct EditableText {
     pub visible_width: Option<f32>,
     /// Allow new lines
     pub allow_newlines: bool,
+    /// When `Some`, the input is obscured (password-style): the editor's
+    /// buffer — and therefore the layout, cursor, selection, and hit-testing —
+    /// contains one mask character per real character, while the real text is
+    /// kept in the [`ObscuredText`] and returned by [`EditableText::value`].
+    ///
+    /// Prefer [`EditableText::new_obscured`] or [`EditableText::set_obscured`]
+    /// over mutating this directly, so buffer and real text stay in sync.
+    pub obscured: Option<ObscuredText>,
 }
 
 impl Default for EditableText {
@@ -159,7 +171,50 @@ impl Default for EditableText {
             visible_lines: Some(1.),
             visible_width: None,
             allow_newlines: false,
+            obscured: None,
         }
+    }
+}
+
+/// The hidden side of an obscured (password-style) [`EditableText`]: the real
+/// text, and the character standing in for each of its `char`s on screen.
+///
+/// The masked editor buffer and `real` are kept in sync by
+/// [`apply_text_edits`]; editing the [`PlainEditor`] buffer directly on an
+/// obscured input desynchronizes them.
+#[derive(Clone)]
+pub struct ObscuredText {
+    mask_char: char,
+    real: String,
+}
+
+impl ObscuredText {
+    /// An empty obscured text using `mask_char` (commonly `'•'` or `'*'`;
+    /// pick one your font supplies).
+    pub fn new(mask_char: char) -> Self {
+        Self {
+            mask_char,
+            real: String::new(),
+        }
+    }
+
+    /// The character shown in place of each real character.
+    pub fn mask_char(&self) -> char {
+        self.mask_char
+    }
+
+    /// The real (hidden) text.
+    pub fn text(&self) -> &str {
+        &self.real
+    }
+
+    pub(crate) fn text_mut(&mut self) -> &mut String {
+        &mut self.real
+    }
+
+    /// One mask character per `char` of `real`.
+    pub(crate) fn mask_of(&self, real: &str) -> String {
+        core::iter::repeat_n(self.mask_char, real.chars().count()).collect()
     }
 }
 
@@ -173,6 +228,42 @@ impl EditableText {
         editable_text
     }
 
+    /// Creates an empty obscured (password-style) `EditableText`.
+    ///
+    /// The layout only ever sees `mask_char`, so glyph widths cannot leak the
+    /// hidden characters; [`EditableText::value`] returns the real text.
+    /// See the module docs for the obscured-mode behavior of clipboard and IME.
+    pub fn new_obscured(mask_char: char) -> Self {
+        Self {
+            obscured: Some(ObscuredText::new(mask_char)),
+            ..Default::default()
+        }
+    }
+
+    /// Turns obscuring on (`Some(mask_char)`) or off (`None`), converting any
+    /// existing content.
+    ///
+    /// Prefer toggling between user edits: queued [`TextEdit`]s are applied
+    /// against the new mode.
+    pub fn set_obscured(&mut self, mask_char: Option<char>) {
+        match (mask_char, self.obscured.take()) {
+            (Some(mask_char), previous) => {
+                let real = match previous {
+                    Some(previous) => previous.real,
+                    None => self.editor.text().to_string(),
+                };
+                let obscured = ObscuredText {
+                    mask_char,
+                    real: String::new(),
+                };
+                self.editor.set_text(&obscured.mask_of(&real));
+                self.obscured = Some(ObscuredText { real, ..obscured });
+            }
+            (None, Some(previous)) => self.editor.set_text(&previous.real),
+            (None, None) => {}
+        }
+    }
+
     /// Access the internal [`PlainEditor`].
     pub fn editor(&self) -> &PlainEditor<TextBrush> {
         &self.editor
@@ -184,11 +275,17 @@ impl EditableText {
         &mut self.editor
     }
 
-    /// Get the current text input as a [`SplitString`].
+    /// Get the current text input.
     ///
-    /// A [`SplitString`] can be converted into a [`String`] using `to_string` if needed.
-    pub fn value(&self) -> SplitString<'_> {
-        self.editor.text()
+    /// For an obscured input this is the *real* (hidden) text, not the mask
+    /// characters in the editor buffer.
+    ///
+    /// Borrowed unless the buffer is split by an in-progress IME preedit.
+    pub fn value(&self) -> Cow<'_, str> {
+        if let Some(obscured) = &self.obscured {
+            return Cow::Borrowed(obscured.text());
+        }
+        split_string_cow(self.editor.text())
     }
 
     /// Queue a [`TextEdit`] action to be applied later by the [`apply_text_edits`] system.
@@ -217,6 +314,7 @@ impl EditableText {
             pending_edits,
             pending_paste,
             max_characters,
+            obscured,
             ..
         } = self;
 
@@ -226,7 +324,13 @@ impl EditableText {
         // pending, hold the remaining edits (untouched in `pending_edits`) for next frame
         // so ordering relative to the paste is preserved.
         if let Some(mut read) = pending_paste.take()
-            && !poll_and_apply_paste(&mut read, &mut driver, *max_characters, &char_filter)
+            && !poll_and_apply_paste(
+                &mut read,
+                &mut driver,
+                obscured.as_mut(),
+                *max_characters,
+                &char_filter,
+            )
         {
             *pending_paste = Some(read);
             return;
@@ -240,14 +344,29 @@ impl EditableText {
             match edit {
                 TextEdit::Paste => {
                     let mut read = clipboard.fetch_text();
-                    if !poll_and_apply_paste(&mut read, &mut driver, *max_characters, &char_filter)
-                    {
+                    if !poll_and_apply_paste(
+                        &mut read,
+                        &mut driver,
+                        obscured.as_mut(),
+                        *max_characters,
+                        &char_filter,
+                    ) {
                         *pending_paste = Some(read);
                         pending_edits.extend(edits);
                         return;
                     }
                 }
-                other => other.apply(&mut driver, clipboard, *max_characters, &char_filter),
+                other => match obscured.as_mut() {
+                    Some(obscured) => crate::text_edit::apply_obscured(
+                        other,
+                        &mut driver,
+                        obscured,
+                        clipboard,
+                        *max_characters,
+                        &char_filter,
+                    ),
+                    None => other.apply(&mut driver, clipboard, *max_characters, &char_filter),
+                },
             }
         }
     }
@@ -260,6 +379,9 @@ impl EditableText {
         self.editor.set_text("");
         self.pending_edits.clear();
         self.pending_paste = None;
+        if let Some(obscured) = &mut self.obscured {
+            obscured.text_mut().clear();
+        }
     }
 
     /// Is the IME currently composing text for this input?
@@ -268,6 +390,18 @@ impl EditableText {
     /// to avoid interrupting the user's composition.
     pub fn is_composing(&self) -> bool {
         self.editor.is_composing()
+    }
+}
+
+/// Join a [`SplitString`] into a `Cow`, borrowing in the common contiguous case.
+fn split_string_cow(split: SplitString<'_>) -> Cow<'_, str> {
+    let mut parts = split.into_iter();
+    let first = parts.next().unwrap_or("");
+    let second = parts.next().unwrap_or("");
+    if second.is_empty() {
+        Cow::Borrowed(first)
+    } else {
+        Cow::Owned([first, second].concat())
     }
 }
 
